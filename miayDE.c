@@ -19,16 +19,15 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <dbus/dbus.h>
-
-#include <systemd/sd-login.h>
+#include <errno.h>
+#include <time.h>
+#include <fcntl.h>
+#include <math.h>
 
 #define MAX_USERS 20
-#define AVATAR_SIZE 60
+#define AVATAR_SIZE 80
 #define SESSION_NAME_MAX 32
-
-// Добавляем в структуру DisplayManager
-pid_t systemd_pid;
-pid_t pulseaudio_pid;
+#define FPS 60
 
 typedef struct {
     char username[32];
@@ -64,49 +63,26 @@ typedef struct {
     int mouse_y;
     int mouse_buttons;
     char dbus_address[256];
+    char error_message[256];
+    char warning_message[256];
+    time_t error_time;
+    time_t warning_time;
+    int show_error;
+    int show_warning;
+    int password_focus;
 } DisplayManager;
 
-
-// Функция для запуска systemd user session
-pid_t start_systemd_user_session() {
-    pid_t pid = fork();
-    if (pid == 0) {
-        // Запускаем systemd user instance
-        char *args[] = {
-            "systemd",
-            "--user",
-            "--unit=basic.target",
-            NULL
-        };
-        
-        setenv("XDG_RUNTIME_DIR", "/run/user/1000", 1);
-        setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus", 1);
-        
-        execvp("/usr/lib/systemd/systemd", args);
-        perror("Failed to start systemd user session");
-        exit(1);
-    }
-    return pid;
-}
-
-// Функция для запуска PulseAudio
-pid_t start_pulseaudio() {
-    pid_t pid = fork();
-    if (pid == 0) {
-        char *args[] = {
-            "pulseaudio",
-            "--daemonize=no",
-            "--exit-idle-time=-1",
-            NULL
-        };
-        
-        setenv("PULSE_RUNTIME_PATH", "/run/user/1000/pulse", 1);
-        execvp("pulseaudio", args);
-        perror("Failed to start PulseAudio");
-        exit(1);
-    }
-    return pid;
-}
+// Градиентные цвета
+#define COLOR_BG1 0xf61a2e
+#define COLOR_BG2 0x16213e
+#define COLOR_ACCENT1 0x0f3460
+#define COLOR_ACCENT2 0xe94560
+#define COLOR_TEXT 0xf0f0f0
+#define COLOR_HIGHLIGHT 0x4cc9f0
+#define COLOR_USER_BG 0x2d2d4d
+#define COLOR_USER_SELECTED 0x4a4a8a
+#define COLOR_PASS_BG 0x3d3d6d
+#define COLOR_PASS_FOCUS 0x5a5a9a
 
 // PAM conversation function
 static int conversation(int num_msg, const struct pam_message **msg,
@@ -129,7 +105,6 @@ static int conversation(int num_msg, const struct pam_message **msg,
                 break;
             case PAM_ERROR_MSG:
             case PAM_TEXT_INFO:
-                // Ignore informative messages
                 break;
             default:
                 free(response);
@@ -141,7 +116,6 @@ static int conversation(int num_msg, const struct pam_message **msg,
     return PAM_SUCCESS;
 }
 
-// Функция для получения списка пользователей
 int get_users(User *users) {
     setpwent();
     struct passwd *p;
@@ -165,18 +139,15 @@ int get_users(User *users) {
     return count;
 }
 
-
 int get_sessions(Session *sessions) {
     int count = 0;
     
-    // GNOME
     if (access("/usr/bin/gnome-session", F_OK) == 0) {
         strcpy(sessions[count].name, "GNOME");
         strcpy(sessions[count].exec, "gnome-session");
         count++;
     }
     
-    // KDE Plasma
     if (access("/usr/bin/startplasma-x11", F_OK) == 0) {
         strcpy(sessions[count].name, "KDE Plasma");
         strcpy(sessions[count].exec, "startplasma-x11");
@@ -188,77 +159,66 @@ int get_sessions(Session *sessions) {
         count++;
     }
     
-    // XFCE
     if (access("/usr/bin/startxfce4", F_OK) == 0) {
         strcpy(sessions[count].name, "XFCE");
         strcpy(sessions[count].exec, "startxfce4");
         count++;
     }
     
-    // LXDE
     if (access("/usr/bin/startlxde", F_OK) == 0) {
         strcpy(sessions[count].name, "LXDE");
         strcpy(sessions[count].exec, "startlxde");
         count++;
     }
     
-    // LXQt
     if (access("/usr/bin/startlxqt", F_OK) == 0) {
         strcpy(sessions[count].name, "LXQt");
         strcpy(sessions[count].exec, "startlxqt");
         count++;
     }
     
-    // MATE
     if (access("/usr/bin/mate-session", F_OK) == 0) {
         strcpy(sessions[count].name, "MATE");
         strcpy(sessions[count].exec, "mate-session");
         count++;
     }
     
-    // Cinnamon
     if (access("/usr/bin/cinnamon-session", F_OK) == 0) {
         strcpy(sessions[count].name, "Cinnamon");
         strcpy(sessions[count].exec, "cinnamon-session");
         count++;
     }
     
-    // Enlightenment
     if (access("/usr/bin/enlightenment_start", F_OK) == 0) {
         strcpy(sessions[count].name, "Enlightenment");
         strcpy(sessions[count].exec, "enlightenment_start");
         count++;
     }
     
-    // i3
     if (access("/usr/bin/i3", F_OK) == 0) {
         strcpy(sessions[count].name, "i3");
         strcpy(sessions[count].exec, "i3");
         count++;
     }
     
-    // Sway (Wayland)
     if (access("/usr/bin/sway", F_OK) == 0) {
         strcpy(sessions[count].name, "Sway");
         strcpy(sessions[count].exec, "sway");
         count++;
     }
     
-    // Openbox
     if (access("/usr/bin/openbox-session", F_OK) == 0) {
         strcpy(sessions[count].name, "Openbox");
         strcpy(sessions[count].exec, "openbox-session");
         count++;
     }
     
-    // Awesome
     if (access("/usr/bin/awesome", F_OK) == 0) {
         strcpy(sessions[count].name, "Awesome");
         strcpy(sessions[count].exec, "awesome");
         count++;
     }
     
-    // Fallback to xterm
     if (count == 0 && access("/usr/bin/xterm", F_OK) == 0) {
         strcpy(sessions[count].name, "XTerm");
         strcpy(sessions[count].exec, "xterm");
@@ -267,33 +227,7 @@ int get_sessions(Session *sessions) {
     
     return count;
 }
-// Функция для получения списка сессий
-/*int get_sessions(Session *sessions) {
-    int count = 0;
-    
-    // i3
-    if (access("/usr/bin/i3", F_OK) == 0) {
-        strcpy(sessions[count].name, "i3");
-        strcpy(sessions[count].exec, "i3");
-        count++;
-    }
-    if (access("/usr/bin/sway", F_OK) == 0) {
-        strcpy(sessions[count].name, "sway");
-        strcpy(sessions[count].exec, "sway");
-        count++;
-    }
-    
-    // Fallback to xterm
-    if (count == 0 && access("/usr/bin/xterm", F_OK) == 0) {
-        strcpy(sessions[count].name, "XTerm");
-        strcpy(sessions[count].exec, "xterm");
-        count++;
-    }
-    
-    return count;
-}*/
 
-// Функция для аутентификации PAM
 int authenticate(const char *username, const char *password) {
     pam_handle_t *pamh = NULL;
     int retval;
@@ -323,7 +257,6 @@ int authenticate(const char *username, const char *password) {
     return 1;
 }
 
-// Функция для запуска DBus session bus
 pid_t start_dbus_session() {
     char dbus_dir[256];
     snprintf(dbus_dir, sizeof(dbus_dir), "/tmp/dbus-%d", getpid());
@@ -331,7 +264,6 @@ pid_t start_dbus_session() {
     
     pid_t pid = fork();
     if (pid == 0) {
-        // Дочерний процесс - запускаем DBus session bus
         char *args[] = {
             "dbus-daemon",
             "--session",
@@ -341,7 +273,6 @@ pid_t start_dbus_session() {
             NULL
         };
         
-        // Перенаправляем вывод для получения адреса
         int fd = open("/tmp/dbus-address", O_WRONLY | O_CREAT | O_TRUNC, 0644);
         dup2(fd, STDOUT_FILENO);
         close(fd);
@@ -353,7 +284,6 @@ pid_t start_dbus_session() {
     return pid;
 }
 
-// Функция для получения DBus адреса
 int get_dbus_address(char *address, size_t size) {
     FILE *fp = fopen("/tmp/dbus-address", "r");
     if (!fp) {
@@ -361,7 +291,6 @@ int get_dbus_address(char *address, size_t size) {
     }
     
     if (fgets(address, size, fp)) {
-        // Убираем перевод строки
         address[strcspn(address, "\n")] = '\0';
         fclose(fp);
         return 1;
@@ -371,7 +300,6 @@ int get_dbus_address(char *address, size_t size) {
     return 0;
 }
 
-// Функция для запуска сессии с правильными переменными окружения
 void start_session(const char *username, const char *session_exec) {
     struct passwd *pwd = getpwnam(username);
     if (!pwd) {
@@ -388,15 +316,14 @@ void start_session(const char *username, const char *session_exec) {
     // DBus и systemd переменные
     char runtime_dir[256];
     snprintf(runtime_dir, sizeof(runtime_dir), "/run/user/%d", pwd->pw_uid);
-    mkdir(runtime_dir, 0700);
+    mkdir(runtime_dir, 0777);
     
     // Важные переменные для X11 и DBus
-    setenv("XDG_RUNTIME_DIR", "/run/user/1000", 1);
+    setenv("XDG_RUNTIME_DIR", runtime_dir, 1);
     setenv("XDG_SESSION_TYPE", "x11", 1);
     setenv("XDG_CURRENT_DESKTOP", "i3", 1);
     setenv("XDG_SESSION_CLASS", "user", 1);
     setenv("XDG_SESSION_DESKTOP", "i3", 1);
-    
     
     // DBus адрес
     char dbus_addr[256];
@@ -409,20 +336,6 @@ void start_session(const char *username, const char *session_exec) {
     mkdir(pulse_dir, 0700);
     setenv("PULSE_RUNTIME_PATH", pulse_dir, 1);
     
-    
-    // DBus переменные
-/*    char dbus_address[256];
-    if (get_dbus_address(dbus_address, sizeof(dbus_address))) {
-        setenv("DBUS_SESSION_BUS_ADDRESS", dbus_address, 1);
-    } else {
-        // Fallback адрес
-        setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/dbus-session", 1);
-    }
-    
-    // PulseAudio переменные
-    setenv("PULSE_RUNTIME_PATH", "/run/user/1000/pulse", 1);
-    setenv("PULSE_COOKIE", "/home/user/.config/pulse/cookie", 0);
-*/    
     // Wayland переменные (на всякий случай)
     unsetenv("WAYLAND_DISPLAY");
     unsetenv("QT_QPA_PLATFORM");
@@ -442,21 +355,7 @@ void start_session(const char *username, const char *session_exec) {
     if (setuid(pwd->pw_uid) != 0) {
         perror("setuid failed");
         exit(1);
-    }    
-    
-
-    // Создаем runtime directory если не существует
-//    char runtime_dir[256];
-    snprintf(runtime_dir, sizeof(runtime_dir), "/run/user/%d", pwd->pw_uid);
-    mkdir(runtime_dir, 0700);
-
-//setenv("PULSE_RUNTIME_PATH", "/run/user/1000/pulse", 1);
-setenv("PULSE_CONFIG_PATH", "/home/user/.config/pulse", 0);
-
-// Создаем pulse runtime directory
-//char pulse_dir[256];
-snprintf(pulse_dir, sizeof(pulse_dir), "/run/user/%d/pulse", pwd->pw_uid);
-mkdir(pulse_dir, 0700);
+    }
     
     // Запускаем сессию через login shell чтобы подгрузить все профили
     char *args[] = {
@@ -469,17 +368,15 @@ mkdir(pulse_dir, 0700);
     };
     
     execvp(pwd->pw_shell, args);
+    perror("Failed to start session");
     exit(1);
 }
 
-// Функция для запуска X сервера
 pid_t start_x_server() {
     pid_t pid = fork();
     if (pid == 0) {
-        // Дочерний процесс - запускаем X сервер
         setenv("DISPLAY", ":0", 1);
         
-        // Аргументы для X сервера
         char *args[] = {
             "X",
             ":0",
@@ -498,7 +395,6 @@ pid_t start_x_server() {
     return pid;
 }
 
-// Функция для проверки готовности X сервера
 int wait_for_x_server() {
     int attempts = 0;
     while (attempts < 50) {
@@ -513,7 +409,6 @@ int wait_for_x_server() {
     return 0;
 }
 
-// Функция для проверки готовности DBus
 int wait_for_dbus() {
     int attempts = 0;
     while (attempts < 30) {
@@ -526,44 +421,102 @@ int wait_for_dbus() {
     return 0;
 }
 
-// Функция для рисования круга (аватарки)
-void draw_circle(Display *display, Window window, GC gc, int x, int y, int radius, int filled) {
-    if (filled) {
-        XFillArc(display, window, gc, x - radius, y - radius, 
-                 radius * 2, radius * 2, 0, 360 * 64);
-    } else {
-        XDrawArc(display, window, gc, x - radius, y - radius, 
-                 radius * 2, radius * 2, 0, 360 * 64);
+void draw_gradient_background(DisplayManager *dm) {
+    // Рисуем градиентный фон
+    for (int y = 0; y < dm->height; y++) {
+        double ratio = (double)y / dm->height;
+        int r1 = (COLOR_BG1 >> 16) & 0xFF;
+        int g1 = (COLOR_BG1 >> 8) & 0xFF;
+        int b1 = COLOR_BG1 & 0xFF;
+        int r2 = (COLOR_BG2 >> 16) & 0xFF;
+        int g2 = (COLOR_BG2 >> 8) & 0xFF;
+        int b2 = COLOR_BG2 & 0xFF;
+        
+        int r = r1 + (r2 - r1) * ratio;
+        int g = g1 + (g2 - g1) * ratio;
+        int b = b1 + (b2 - b1) * ratio;
+        
+        unsigned long color = (r << 16) | (g << 8) | b;
+        XSetForeground(dm->display, dm->gc, color);
+        XDrawLine(dm->display, dm->window, dm->gc, 0, y, dm->width, y);
     }
 }
 
-// Функция для проверки попадания точки в прямоугольник
+void draw_rounded_rect(DisplayManager *dm, int x, int y, int width, int height, int radius, unsigned long color) {
+    XSetForeground(dm->display, dm->gc, color);
+    
+    // Основной прямоугольник
+    XFillRectangle(dm->display, dm->window, dm->gc, x + radius, y, width - 2 * radius, height);
+    XFillRectangle(dm->display, dm->window, dm->gc, x, y + radius, width, height - 2 * radius);
+    
+    // Углы
+    XFillArc(dm->display, dm->window, dm->gc, x, y, 2 * radius, 2 * radius, 90 * 64, 90 * 64);
+    XFillArc(dm->display, dm->window, dm->gc, x + width - 2 * radius, y, 2 * radius, 2 * radius, 0, 90 * 64);
+    XFillArc(dm->display, dm->window, dm->gc, x, y + height - 2 * radius, 2 * radius, 2 * radius, 180 * 64, 90 * 64);
+    XFillArc(dm->display, dm->window, dm->gc, x + width - 2 * radius, y + height - 2 * radius, 2 * radius, 2 * radius, 270 * 64, 90 * 64);
+}
+
+void draw_user_avatar(DisplayManager *dm, int x, int y, int selected) {
+    int radius = AVATAR_SIZE / 2;
+    
+    // Фон аватарки
+    XSetForeground(dm->display, dm->gc, selected ? COLOR_USER_SELECTED : COLOR_USER_BG);
+    XFillArc(dm->display, dm->window, dm->gc, x, y, AVATAR_SIZE, AVATAR_SIZE, 0, 360 * 64);
+    
+    // Обводка если выбрано
+    if (selected) {
+        XSetForeground(dm->display, dm->gc, COLOR_HIGHLIGHT);
+        XSetLineAttributes(dm->display, dm->gc, 3, LineSolid, CapRound, JoinRound);
+        XDrawArc(dm->display, dm->window, dm->gc, x, y, AVATAR_SIZE, AVATAR_SIZE, 0, 360 * 64);
+        XSetLineAttributes(dm->display, dm->gc, 1, LineSolid, CapRound, JoinRound);
+    }
+    
+    // Смайлик
+    XSetForeground(dm->display, dm->gc, COLOR_TEXT);
+    
+    // Глаза
+    XFillArc(dm->display, dm->window, dm->gc, x + radius - 15, y + radius - 10, 10, 10, 0, 360 * 64);
+    XFillArc(dm->display, dm->window, dm->gc, x + radius + 5, y + radius - 10, 10, 10, 0, 360 * 64);
+    
+    // Улыбка
+    XDrawArc(dm->display, dm->window, dm->gc, x + radius - 15, y + radius, 30, 20, 0, 180 * 64);
+}
+
+void draw_mouse_cursor(DisplayManager *dm) {
+    XSetForeground(dm->display, dm->gc, COLOR_HIGHLIGHT);
+    XSetLineAttributes(dm->display, dm->gc, 2, LineSolid, CapRound, JoinRound);
+    
+    // Крестик без пересечения
+    XDrawLine(dm->display, dm->window, dm->gc, dm->mouse_x - 8, dm->mouse_y, dm->mouse_x - 2, dm->mouse_y);
+    XDrawLine(dm->display, dm->window, dm->gc, dm->mouse_x + 2, dm->mouse_y, dm->mouse_x + 8, dm->mouse_y);
+    XDrawLine(dm->display, dm->window, dm->gc, dm->mouse_x, dm->mouse_y - 8, dm->mouse_x, dm->mouse_y - 2);
+    XDrawLine(dm->display, dm->window, dm->gc, dm->mouse_x, dm->mouse_y + 2, dm->mouse_x, dm->mouse_y + 8);
+    
+    // Точка в центре
+    XFillArc(dm->display, dm->window, dm->gc, dm->mouse_x - 2, dm->mouse_y - 2, 4, 4, 0, 360 * 64);
+    
+    XSetLineAttributes(dm->display, dm->gc, 1, LineSolid, CapRound, JoinRound);
+}
+
 int point_in_rect(int x, int y, int rect_x, int rect_y, int width, int height) {
     return (x >= rect_x && x <= rect_x + width && y >= rect_y && y <= rect_y + height);
 }
 
-// Функция для рисования курсора мыши
-void draw_mouse_cursor(DisplayManager *dm) {
-    XSetForeground(dm->display, dm->gc, 0xffffff);
-    XDrawLine(dm->display, dm->window, dm->gc, dm->mouse_x, dm->mouse_y, dm->mouse_x + 10, dm->mouse_y);
-    XDrawLine(dm->display, dm->window, dm->gc, dm->mouse_x, dm->mouse_y, dm->mouse_x, dm->mouse_y + 10);
-    XDrawLine(dm->display, dm->window, dm->gc, dm->mouse_x, dm->mouse_y, dm->mouse_x + 7, dm->mouse_y + 7);
-}
-
-// Функция для обработки кликов мыши
 void handle_mouse_click(DisplayManager *dm, int x, int y, int button) {
+    // Клик по пользователям
     for (int i = 0; i < dm->user_count; i++) {
-        int user_y = 80 + i * 90;
-        int avatar_x = 50;
+        int user_y = 120 + i * 140;
+        int avatar_x = 80;
         int avatar_y = user_y;
         
-        if (point_in_rect(x, y, avatar_x, avatar_y, AVATAR_SIZE + 200, AVATAR_SIZE)) {
+        if (point_in_rect(x, y, avatar_x - 10, avatar_y - 10, AVATAR_SIZE + 20, AVATAR_SIZE + 20)) {
             for (int j = 0; j < dm->user_count; j++) {
                 dm->users[j].selected = 0;
             }
             dm->users[i].selected = 1;
             dm->selected_user = i;
             dm->password_active = 1;
+            dm->password_focus = 1;
             dm->show_sessions = 0;
             memset(dm->password, 0, sizeof(dm->password));
             return;
@@ -571,74 +524,164 @@ void handle_mouse_click(DisplayManager *dm, int x, int y, int button) {
     }
     
     if (dm->password_active && dm->selected_user >= 0) {
-        int session_button_x = dm->width/2 - 175;
-        int session_button_y = dm->height/2 + 40;
+        // Клик по полю пароля
+        int pass_field_x = dm->width/2 - 230;
+        int pass_field_y = dm->height/2 - 30;
         
-        if (point_in_rect(x, y, session_button_x, session_button_y, 350, 30)) {
+        if (point_in_rect(x, y, pass_field_x, pass_field_y, 460, 60)) {
+            dm->password_focus = 1;
+            return;
+        }
+        
+        // Клик по кнопке сессии
+        int session_button_x = dm->width/2 - 230;
+        int session_button_y = dm->height/2 + 70;
+        
+        if (point_in_rect(x, y, session_button_x, session_button_y, 460, 50)) {
+            dm->password_focus = 0;
             dm->show_sessions = !dm->show_sessions;
             return;
         }
         
+        // Клик по элементам выпадающего списка сессий
         if (dm->show_sessions) {
             for (int i = 0; i < dm->session_count; i++) {
-                int item_y = dm->height/2 + 70 + i * 30;
-                if (point_in_rect(x, y, session_button_x, item_y, 350, 30)) {
+                int item_y = dm->height/2 + 130 + i * 50;
+                if (point_in_rect(x, y, session_button_x, item_y, 460, 50)) {
                     dm->selected_session = i;
                     dm->show_sessions = 0;
                     return;
                 }
             }
         }
+        
+        // Клик вне элементов - снимаем фокус
+        dm->password_focus = 0;
     }
 }
 
-// Функция для рисования интерфейса
-void draw_interface(DisplayManager *dm) {
-    XClearWindow(dm->display, dm->window);
+void show_error(DisplayManager *dm, const char *message) {
+    strncpy(dm->error_message, message, sizeof(dm->error_message)-1);
+    dm->error_time = time(NULL);
+    dm->show_error = 1;
+}
+
+void show_warning(DisplayManager *dm, const char *message) {
+    strncpy(dm->warning_message, message, sizeof(dm->warning_message)-1);
+    dm->warning_time = time(NULL);
+    dm->show_warning = 1;
+}
+
+void draw_notifications(DisplayManager *dm) {
+    time_t current_time = time(NULL);
     
-    XSetForeground(dm->display, dm->gc, 0x2d2d2d);
-    XFillRectangle(dm->display, dm->window, dm->gc, 0, 0, dm->width, dm->height);
-    
-    for (int i = 0; i < dm->user_count; i++) {
-        int y = 80 + i * 90;
-        
-        XSetForeground(dm->display, dm->gc, 0x888888);
-        draw_circle(dm->display, dm->window, dm->gc, 50 + AVATAR_SIZE/2, y + AVATAR_SIZE/2, AVATAR_SIZE/2, 1);
-        
-        XSetForeground(dm->display, dm->gc, 0x000000);
-        draw_circle(dm->display, dm->window, dm->gc, 50 + AVATAR_SIZE/3, y + AVATAR_SIZE/3, AVATAR_SIZE/10, 1);
-        draw_circle(dm->display, dm->window, dm->gc, 50 + 2*AVATAR_SIZE/3, y + AVATAR_SIZE/3, AVATAR_SIZE/10, 1);
-        
-        XDrawArc(dm->display, dm->window, dm->gc, 
-                50 + AVATAR_SIZE/4, y + AVATAR_SIZE/2, 
-                AVATAR_SIZE/2, AVATAR_SIZE/3, 
-                0, 180 * 64);
-        
-        if (dm->users[i].selected) {
-            XSetForeground(dm->display, dm->gc, 0x3498db);
-            draw_circle(dm->display, dm->window, dm->gc, 50 + AVATAR_SIZE/2, y + AVATAR_SIZE/2, AVATAR_SIZE/2 + 5, 0);
-        }
+    if (dm->show_error && (current_time - dm->error_time < 5)) {
+        draw_rounded_rect(dm, dm->width - 380, 30, 350, 70, 15, 0xff4444);
         
         XSetForeground(dm->display, dm->gc, 0xffffff);
         XDrawString(dm->display, dm->window, dm->gc, 
-                   50 + AVATAR_SIZE + 15, y + AVATAR_SIZE/2 + 5, 
+                   dm->width - 370, 55, "Error:", 6);
+        XDrawString(dm->display, dm->window, dm->gc, 
+                   dm->width - 370, 75, dm->error_message, strlen(dm->error_message));
+    } else {
+        dm->show_error = 0;
+    }
+    
+    if (dm->show_warning && (current_time - dm->warning_time < 5)) {
+        draw_rounded_rect(dm, dm->width - 380, 110, 350, 70, 15, 0xffcc00);
+        
+        XSetForeground(dm->display, dm->gc, 0x000000);
+        XDrawString(dm->display, dm->window, dm->gc, 
+                   dm->width - 370, 135, "Warning:", 8);
+        XDrawString(dm->display, dm->window, dm->gc, 
+                   dm->width - 370, 155, dm->warning_message, strlen(dm->warning_message));
+    } else {
+        dm->show_warning = 0;
+    }
+}
+
+void handle_key_press(DisplayManager *dm, XKeyEvent *event) {
+    if (dm->password_active && dm->selected_user >= 0 && dm->password_focus) {
+        char keybuf[8];
+        KeySym key;
+        XLookupString(event, keybuf, sizeof(keybuf), &key, NULL);
+        
+        if (key == XK_Return) {
+            if (authenticate(dm->users[dm->selected_user].username, dm->password)) {
+                printf("Authentication successful! Starting session...\n");
+                
+                // Освобождаем ресурсы X11 перед запуском сессии
+                XUngrabPointer(dm->display, CurrentTime);
+                XUngrabKeyboard(dm->display, CurrentTime);
+                
+                if (dm->font) {
+                    XFreeFont(dm->display, dm->font);
+                }
+                XFreeGC(dm->display, dm->gc);
+                XDestroyWindow(dm->display, dm->window);
+                XCloseDisplay(dm->display);
+                
+                // Запускаем сессию
+                start_session(dm->users[dm->selected_user].username, 
+                             dm->sessions[dm->selected_session].exec);
+                
+                // Если сессия завершилась, выходим
+                exit(0);
+            } else {
+                printf("Authentication failed!\n");
+                show_error(dm, "Invalid password");
+                memset(dm->password, 0, sizeof(dm->password));
+            }
+        } else if (key == XK_BackSpace) {
+            if (strlen(dm->password) > 0) {
+                dm->password[strlen(dm->password)-1] = '\0';
+            }
+        } else if (keybuf[0] >= 32 && keybuf[0] <= 126) {
+            if (strlen(dm->password) < sizeof(dm->password)-1) {
+                strncat(dm->password, keybuf, 1);
+            }
+        }
+    }
+}
+
+void draw_interface(DisplayManager *dm) {
+    // Рисуем градиентный фон
+    draw_gradient_background(dm);
+    
+    // Рисуем список пользователей слева
+    for (int i = 0; i < dm->user_count; i++) {
+        int y = 120 + i * 140;
+        
+        // Фон пользователя
+        draw_rounded_rect(dm, 50, y - 15, 300, 110, 20, 
+                         dm->users[i].selected ? COLOR_USER_SELECTED : COLOR_USER_BG);
+        
+        // Аватарка
+        draw_user_avatar(dm, 80, y, dm->users[i].selected);
+        
+        // Имя пользователя
+        XSetForeground(dm->display, dm->gc, COLOR_TEXT);
+        XDrawString(dm->display, dm->window, dm->gc, 
+                   150, y + AVATAR_SIZE/2 + 5, 
                    dm->users[i].display_name, strlen(dm->users[i].display_name));
     }
     
+    // Поле ввода пароля
     if (dm->password_active && dm->selected_user >= 0) {
-        XSetForeground(dm->display, dm->gc, 0x3498db);
-        XFillRectangle(dm->display, dm->window, dm->gc, 
-                      dm->width/2 - 175, dm->height/2 - 30, 350, 60);
+        // Основное поле
+        draw_rounded_rect(dm, dm->width/2 - 250, dm->height/2 - 60, 500, 240, 30, COLOR_PASS_BG);
         
-        XSetForeground(dm->display, dm->gc, 0xffffff);
-        XFillRectangle(dm->display, dm->window, dm->gc, 
-                      dm->width/2 - 170, dm->height/2 - 25, 340, 50);
-        
-        XSetForeground(dm->display, dm->gc, 0x333333);
+        // Заголовок
+        XSetForeground(dm->display, dm->gc, COLOR_TEXT);
         XDrawString(dm->display, dm->window, dm->gc, 
-                   dm->width/2 - 165, dm->height/2 - 40, 
-                   "Password:", 9);
+                   dm->width/2 - 230, dm->height/2 - 85, 
+                   "Enter Password:", 15);
         
+        // Поле ввода (подсвечиваем если в фокусе)
+        unsigned long pass_color = dm->password_focus ? COLOR_PASS_FOCUS : 0xffffff;
+        draw_rounded_rect(dm, dm->width/2 - 230, dm->height/2 - 30, 460, 60, 20, pass_color);
+        
+        // Текст пароля
         XSetForeground(dm->display, dm->gc, 0x000000);
         if (strlen(dm->password) > 0) {
             char stars[strlen(dm->password) + 1];
@@ -646,15 +689,25 @@ void draw_interface(DisplayManager *dm) {
                 stars[i] = '*';
             }
             stars[strlen(dm->password)] = '\0';
+            
+            // Центрируем текст пароля
+            int text_width = XTextWidth(dm->font, stars, strlen(stars));
+            int x_pos = dm->width/2 - text_width/2;
             XDrawString(dm->display, dm->window, dm->gc, 
-                       dm->width/2 - 160, dm->height/2 + 5, stars, strlen(stars));
+                       x_pos, dm->height/2 + 10, stars, strlen(stars));
+        } else if (dm->password_focus) {
+            // Мигающий курсор когда поле в фокусе и пустое
+            time_t current_time = time(NULL);
+            if (current_time % 2 == 0) {
+                XDrawString(dm->display, dm->window, dm->gc, 
+                           dm->width/2 - 220, dm->height/2 + 10, "|", 1);
+            }
         }
         
-        XSetForeground(dm->display, dm->gc, 0x555555);
-        XFillRectangle(dm->display, dm->window, dm->gc, 
-                      dm->width/2 - 175, dm->height/2 + 40, 350, 30);
+        // Кнопка выбора сессии
+        draw_rounded_rect(dm, dm->width/2 - 230, dm->height/2 + 70, 460, 50, 20, COLOR_ACCENT1);
         
-        XSetForeground(dm->display, dm->gc, 0xffffff);
+        XSetForeground(dm->display, dm->gc, COLOR_TEXT);
         char session_text[64];
         if (dm->session_count > 0) {
             snprintf(session_text, sizeof(session_text), "Session: %s ▼", 
@@ -662,34 +715,43 @@ void draw_interface(DisplayManager *dm) {
         } else {
             strcpy(session_text, "No sessions available");
         }
-        XDrawString(dm->display, dm->window, dm->gc, 
-                   dm->width/2 - 160, dm->height/2 + 60, session_text, strlen(session_text));
         
+        // Центрируем текст сессии
+        int text_width = XTextWidth(dm->font, session_text, strlen(session_text));
+        int x_pos = dm->width/2 - text_width/2;
+        XDrawString(dm->display, dm->window, dm->gc, 
+                   x_pos, dm->height/2 + 100, session_text, strlen(session_text));
+        
+        // Выпадающий список сессий
         if (dm->show_sessions) {
-            XSetForeground(dm->display, dm->gc, 0xffffff);
-            XFillRectangle(dm->display, dm->window, dm->gc, 
-                          dm->width/2 - 175, dm->height/2 + 70, 350, dm->session_count * 30);
+            draw_rounded_rect(dm, dm->width/2 - 230, dm->height/2 + 130, 460, dm->session_count * 50, 20, 0xffffff);
             
             for (int i = 0; i < dm->session_count; i++) {
                 if (i == dm->selected_session) {
-                    XSetForeground(dm->display, dm->gc, 0x3498db);
-                    XFillRectangle(dm->display, dm->window, dm->gc, 
-                                  dm->width/2 - 175, dm->height/2 + 70 + i * 30, 350, 30);
+                    draw_rounded_rect(dm, dm->width/2 - 230, dm->height/2 + 130 + i * 50, 460, 50, 20, COLOR_HIGHLIGHT);
                 }
                 
-                XSetForeground(dm->display, dm->gc, i == dm->selected_session ? 0xffffff : 0x333333);
+                XSetForeground(dm->display, dm->gc, i == dm->selected_session ? 0xffffff : 0x000000);
+                
+                // Центрируем текст сессии
+                text_width = XTextWidth(dm->font, dm->sessions[i].name, strlen(dm->sessions[i].name));
+                x_pos = dm->width/2 - text_width/2;
                 XDrawString(dm->display, dm->window, dm->gc, 
-                           dm->width/2 - 160, dm->height/2 + 90 + i * 30, 
+                           x_pos, dm->height/2 + 160 + i * 50, 
                            dm->sessions[i].name, strlen(dm->sessions[i].name));
             }
         }
     }
     
+    // Уведомления
+    draw_notifications(dm);
+    
+    // Курсор мыши
     draw_mouse_cursor(dm);
+    
     XFlush(dm->display);
 }
 
-// Обработчик сигналов для cleanup
 void signal_handler(int sig) {
     exit(0);
 }
@@ -701,13 +763,17 @@ int main() {
     dm.mouse_x = 100;
     dm.mouse_y = 100;
     dm.mouse_buttons = 0;
+    dm.show_error = 0;
+    dm.show_warning = 0;
+    dm.error_time = 0;
+    dm.warning_time = 0;
+    dm.password_focus = 0;
     
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     
     printf("Starting DBus session bus...\n");
     
-    // Запускаем DBus session bus
     dm.dbus_pid = start_dbus_session();
     if (dm.dbus_pid < 0) {
         fprintf(stderr, "Failed to start DBus\n");
@@ -721,7 +787,6 @@ int main() {
         return 1;
     }
     
-    // Получаем DBus адрес
     if (get_dbus_address(dm.dbus_address, sizeof(dm.dbus_address))) {
         printf("DBus address: %s\n", dm.dbus_address);
         setenv("DBUS_SESSION_BUS_ADDRESS", dm.dbus_address, 1);
@@ -763,125 +828,125 @@ int main() {
                                    BlackPixel(dm.display, dm.screen),
                                    BlackPixel(dm.display, dm.screen));
     
-    XStoreName(dm.display, dm.window, "Simple Display Manager");
-    XSelectInput(dm.display, dm.window, 
-                ExposureMask | KeyPressMask | ButtonPressMask | 
+    XStoreName(dm.display, dm.window, "Modern Display Manager");
+     // Устанавливаем события
+    XSelectInput(dm.display, dm.window,
+                ExposureMask | KeyPressMask | ButtonPressMask |
                 ButtonReleaseMask | PointerMotionMask | StructureNotifyMask);
-    
+
     XSetWindowAttributes attrs;
     attrs.override_redirect = True;
     XChangeWindowAttributes(dm.display, dm.window, CWOverrideRedirect, &attrs);
-    
+
     XMapWindow(dm.display, dm.window);
     XRaiseWindow(dm.display, dm.window);
-    
-    XGrabPointer(dm.display, dm.window, True, 
+
+    XGrabPointer(dm.display, dm.window, True,
                 ButtonPressMask | ButtonReleaseMask | PointerMotionMask,
                 GrabModeAsync, GrabModeAsync, dm.window, None, CurrentTime);
     XGrabKeyboard(dm.display, dm.window, True, GrabModeAsync, GrabModeAsync, CurrentTime);
-    
+
     dm.gc = XCreateGC(dm.display, dm.window, 0, NULL);
     XSetForeground(dm.display, dm.gc, WhitePixel(dm.display, dm.screen));
     XSetBackground(dm.display, dm.gc, BlackPixel(dm.display, dm.screen));
-    
-    dm.font = XLoadQueryFont(dm.display, "fixed");
+
+    // Загружаем большой шрифт DejaVu Sans Mono 18
+    dm.font = XLoadQueryFont(dm.display, "-misc-dejavu sans mono-medium-r-normal--18-0-0-0-m-0-iso10646-1");
+    if (!dm.font) {
+        dm.font = XLoadQueryFont(dm.display, "9x15");
+    }
     if (dm.font) {
         XSetFont(dm.display, dm.gc, dm.font->fid);
     }
-    
+
+    // Получаем данные
     dm.user_count = get_users(dm.users);
     dm.selected_user = 0;
     dm.password_active = 0;
-    
+
     dm.session_count = get_sessions(dm.sessions);
     dm.selected_session = 0;
     dm.show_sessions = 0;
-    
+
     XEvent event;
     int running = 1;
-    
+
+    // Устанавливаем высокую частоту обновления
+    struct timespec frame_time;
+    frame_time.tv_sec = 0;
+    frame_time.tv_nsec = 1000000000 / FPS;
+
+    // Двойная буферизация для избежания мерцания
+    Pixmap buffer = XCreatePixmap(dm.display, dm.window, dm.width, dm.height, DefaultDepth(dm.display, dm.screen));
+    GC buffer_gc = XCreateGC(dm.display, buffer, 0, NULL);
+
     while (running) {
-        XNextEvent(dm.display, &event);
-        
-        switch (event.type) {
-            case Expose:
-                draw_interface(&dm);
-                break;
-                
-            case MotionNotify:
-                dm.mouse_x = event.xmotion.x;
-                dm.mouse_y = event.xmotion.y;
-                draw_interface(&dm);
-                break;
-                
-            case ButtonPress:
-                dm.mouse_x = event.xbutton.x;
-                dm.mouse_y = event.xbutton.y;
-                dm.mouse_buttons |= (1 << (event.xbutton.button - 1));
-                handle_mouse_click(&dm, event.xbutton.x, event.xbutton.y, event.xbutton.button);
-                draw_interface(&dm);
-                break;
-                
-            case ButtonRelease:
-                dm.mouse_x = event.xbutton.x;
-                dm.mouse_y = event.xbutton.y;
-                dm.mouse_buttons &= ~(1 << (event.xbutton.button - 1));
-                draw_interface(&dm);
-                break;
-                
-            case KeyPress:
-                if (dm.password_active && dm.selected_user >= 0) {
-                    char keybuf[8];
-                    KeySym key;
-                    XLookupString(&event.xkey, keybuf, sizeof(keybuf), &key, NULL);
-                    
-                    if (key == XK_Return) {
-                        if (authenticate(dm.users[dm.selected_user].username, dm.password)) {
-                            printf("Authentication successful!\n");
-                            XUngrabPointer(dm.display, CurrentTime);
-                            XUngrabKeyboard(dm.display, CurrentTime);
-                            start_session(dm.users[dm.selected_user].username, 
-                                         dm.sessions[dm.selected_session].exec);
-                            running = 0;
-                        } else {
-                            printf("Authentication failed!\n");
-                            memset(dm.password, 0, sizeof(dm.password));
-                        }
-                        draw_interface(&dm);
-                    } else if (key == XK_BackSpace) {
-                        if (strlen(dm.password) > 0) {
-                            dm.password[strlen(dm.password)-1] = '\0';
-                            draw_interface(&dm);
-                        }
-                    } else if (keybuf[0] >= 32 && keybuf[0] <= 126) {
-                        if (strlen(dm.password) < sizeof(dm.password)-1) {
-                            strncat(dm.password, keybuf, 1);
-                            draw_interface(&dm);
-                        }
-                    }
-                }
-                break;
-                
-            case ConfigureNotify:
-                dm.width = event.xconfigure.width;
-                dm.height = event.xconfigure.height;
-                draw_interface(&dm);
-                break;
+        // Обрабатываем все события
+        while (XPending(dm.display)) {
+            XNextEvent(dm.display, &event);
+
+            switch (event.type) {
+                case MotionNotify:
+                    dm.mouse_x = event.xmotion.x;
+                    dm.mouse_y = event.xmotion.y;
+                    break;
+
+                case ButtonPress:
+                    dm.mouse_x = event.xbutton.x;
+                    dm.mouse_y = event.xbutton.y;
+                    dm.mouse_buttons |= (1 << (event.xbutton.button - 1));
+                    handle_mouse_click(&dm, event.xbutton.x, event.xbutton.y, event.xbutton.button);
+                    break;
+
+                case ButtonRelease:
+                    dm.mouse_x = event.xbutton.x;
+                    dm.mouse_y = event.xbutton.y;
+                    dm.mouse_buttons &= ~(1 << (event.xbutton.button - 1));
+                    break;
+
+                case KeyPress:
+                    handle_key_press(&dm, &event.xkey);
+                    break;
+
+                case ConfigureNotify:
+                    dm.width = event.xconfigure.width;
+                    dm.height = event.xconfigure.height;
+                    XFreePixmap(dm.display, buffer);
+                    buffer = XCreatePixmap(dm.display, dm.window, dm.width, dm.height, DefaultDepth(dm.display, dm.screen));
+                    break;
+            }
         }
+
+        // Отрисовываем в буфер
+        DisplayManager dm_buffer = dm;
+        dm_buffer.display = dm.display;
+        dm_buffer.window = buffer;
+        dm_buffer.gc = buffer_gc;
+
+        draw_interface(&dm_buffer);
+
+        // Копируем буфер на экран
+        XCopyArea(dm.display, buffer, dm.window, dm.gc, 0, 0, dm.width, dm.height, 0, 0);
+
+        // Задержка для поддержания FPS
+        nanosleep(&frame_time, NULL);
     }
-    
+
+    // Cleanup
+    XFreePixmap(dm.display, buffer);
+    XFreeGC(dm.display, buffer_gc);
+
     if (dm.font) {
         XFreeFont(dm.display, dm.font);
     }
     XFreeGC(dm.display, dm.gc);
     XDestroyWindow(dm.display, dm.window);
     XCloseDisplay(dm.display);
-    
+
     kill(dm.xserver_pid, SIGTERM);
     kill(dm.dbus_pid, SIGTERM);
-    
-    // Удаляем временные файлы
+
     unlink("/tmp/dbus-address");
-    
+
     return 0;
 }
