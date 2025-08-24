@@ -46,5 +46,7 @@ systemctl enable miayDE.service
 
 <img src="https://github.com/oditynet/miayDE/blob/main/screen.jpg" title="example" width="800" />
 
+<img src="https://github.com/oditynet/miayDE/blob/main/screen1.jpg" title="example" width="800" />
+
 Problem:
 1) Пока система инициализbрует DBus, но звука нет (не все окружение заполнено )
